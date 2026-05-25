@@ -1,0 +1,26 @@
+name: Deploy to Pi
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout latest code
+        uses: actions/checkout@v4
+
+      - name: Install Python dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Restart app
+        run: |
+          sudo systemctl restart finance-app
+
+      - name: Health check
+        run: |
+          sleep 3
+          curl -f http://localhost:8000 || exit 1
