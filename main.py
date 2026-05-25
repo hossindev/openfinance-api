@@ -1,0 +1,166 @@
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from jose import jwt
+from datetime import datetime, timedelta
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import bcrypt
+import os
+import redis
+import asyncpg
+import json
+from dotenv import load_dotenv
+from contextlib import asynccontextmanager
+
+load_dotenv()
+DATABASE_URL = f"postgresql://openfinance:{os.getenv('password')}@localhost/openfinance_db"
+pool: asyncpg.pool = None
+r = redis.Redis(host='localhost', port=6379, decode_responses=True)
+SECRET_KEY=os.getenv("SECRET_KEY")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global pool
+    pool = await asyncpg.create_pool(DATABASE_URL)
+    yield
+    await pool.close()
+app = FastAPI(lifespan=lifespan)
+security = HTTPBearer()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # later the real url only
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+#__________________________________________
+#HELPERS
+#__________________________________________
+
+def create_access_token(data:dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp":expire})
+    return jwt.encode(to_encode,SECRET_KEY,algorithm=ALGORITHM)
+async def get_current_user(credentials:HTTPAuthorizationCredentials = Depends(security)):
+    token = credentials.credentials
+    try:
+        payload = jwt.decode(token,SECRET_KEY,algorithms=[ALGORITHM])
+        user_id = payload.get("sub")
+        if user_id is None:
+            raise HTTPException(status_code=401,detail="Invalid token")
+        return user_id
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Invalid or expired token or {str(e)}")
+    
+def redis_set(table: str, data: dict):
+    existing = r.get(table)
+    rows = json.loads(existing) if existing else []
+    rows.append(data)
+    r.set(table, json.dumps(rows))
+
+def redis_where(table: str, field: str, value: str) -> list:
+    existing = r.get(table)
+    if not existing:
+        return []
+    rows = json.loads(existing)
+    return [row for row in rows if str(row.get(field)) == str(value)]
+
+def redis_get_table(table: str) -> list:
+    existing = r.get(table)
+    if not existing:
+        return []
+    return json.loads(existing)
+
+#__________________________________________
+#CLASSES
+#__________________________________________
+class Token(BaseModel):
+    access_token:str
+    token_type:str
+
+class LoginData(BaseModel):
+    email:str
+    password:str
+
+class Accounts(BaseModel):
+    name:str
+    account_type:str
+
+
+#__________________________________________
+#SIGNUP
+#__________________________________________
+@app.post("/signup")
+async def signup(data:LoginData):
+    try:
+        email = data.email
+        password = data.password
+        hashed = bcrypt.hashpw(password.encode("utf-8"),bcrypt.gensalt())
+        
+        existing = redis_where("users","email",email)
+        if existing:
+            return{"error":"user already exists"}
+        else:
+            async with pool.acquire() as conn:
+                existing = await conn.fetchrow(
+                    "SELECT * FROM users WHERE email = $1",email
+                )
+                if existing:
+                    return{"error":"user already exists"}
+                user = await conn.fetchrow(
+                    "INSERT INTO users (email,password) VALUES ($1,$2) RETURNING *",email , hashed.decode("utf-8")
+                )   
+                redis_set("users", dict(user))
+                return {"signup":True}
+    except Exception as e:
+        print(f"SIGNUP ERROR: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    
+#__________________________________________
+#LOGIN WITH JWT
+#__________________________________________
+@app.post("/login")
+async def login(data:LoginData):
+    try:
+        email = data.email
+        password = data.password
+        
+        results = redis_where("users","email",email)
+        if not results:
+            #DB FALLBACK COMING SOON
+           pass
+        user = results[0]
+        if not user or not bcrypt.checkpw(
+            password.encode(),user["password"].encode()
+            ):
+                raise HTTPException(status_code=401, detail="Invalid credentials")
+        
+        
+        access_token = create_access_token(data={"sub": str(user["user_id"])})
+        return{"login":True,"access_token":access_token, "token_type": "bearer"}
+        
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+
+#__________________________________________
+# CREATE ACCOUNt
+#__________________________________________  
+@app.post("/create-account")
+async def create_account(data:Accounts ,user_id:str = Depends(get_current_user) ):
+    try:
+        name = data.name
+        account_type = data.account_type
+        async with pool.acquire() as conn:
+            account = await conn.fetchrow(
+                "INSERT INTO accounts (user_id,name,type) VALUES ($1,$2,$3) RETURNING *", user_id,name,account_type
+            )
+            redis_set("accounts",dict(account))
+
+        return {"sucess":True}
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=str(e))
