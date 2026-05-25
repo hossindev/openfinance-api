@@ -1,4 +1,4 @@
-name: Deploy to Pi
+name: Deploy OpenFinance API
 
 on:
   push:
@@ -9,18 +9,20 @@ jobs:
     runs-on: self-hosted
 
     steps:
-      - name: Checkout latest code
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install Python dependencies
+      - name: Set up venv and install requirements
         run: |
-          pip install -r requirements.txt
+          python3 -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -r requirements.txt
 
-      - name: Restart app
+      - name: Restart OpenFinance API
         run: |
-          sudo systemctl restart finance-app
+          sudo systemctl restart openfinance
 
       - name: Health check
         run: |
-          sleep 3
+          sleep 4
           curl -f http://localhost:8000 || exit 1
