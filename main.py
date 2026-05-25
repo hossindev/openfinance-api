@@ -11,6 +11,7 @@ import asyncpg
 import json
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
+import uuid
 
 load_dotenv()
 DATABASE_URL = f"postgresql://openfinance:{os.getenv('password')}@localhost/openfinance_db"
@@ -56,24 +57,25 @@ async def get_current_user(credentials:HTTPAuthorizationCredentials = Depends(se
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Invalid or expired token or {str(e)}")
     
-def redis_set(table: str, data: dict):
-    existing = r.get(table)
-    rows = json.loads(existing) if existing else []
-    rows.append(data)
-    r.set(table, json.dumps(rows))
+def cache_user(email: str, user_data: dict):
+    r.set(f"user:{email}", json.dumps(user_data))
 
-def redis_where(table: str, field: str, value: str) -> list:
-    existing = r.get(table)
-    if not existing:
-        return []
-    rows = json.loads(existing)
-    return [row for row in rows if str(row.get(field)) == str(value)]
+def get_cached_user(email: str):
+    data = r.get(f"user:{email}")
+    return json.loads(data) if data else None
 
-def redis_get_table(table: str) -> list:
-    existing = r.get(table)
-    if not existing:
-        return []
-    return json.loads(existing)
+def cache_account(user_id: str, account_data: dict):
+    key = f"user_accounts:{user_id}"
+    existing = r.get(key)
+    accounts = json.loads(existing) if existing else []
+    accounts.append(account_data)
+    r.set(key, json.dumps(accounts))
+
+def serialize_record(record: dict) -> dict:
+    return {
+        k: str(v) if isinstance(v, (uuid.UUID, datetime)) else v 
+        for k, v in record.items()
+    }
 
 #__________________________________________
 #CLASSES
@@ -101,7 +103,7 @@ async def signup(data:LoginData):
         password = data.password
         hashed = bcrypt.hashpw(password.encode("utf-8"),bcrypt.gensalt())
         
-        existing = redis_where("users","email",email)
+        existing = get_cached_user(email)
         if existing:
             return{"error":"user already exists"}
         else:
@@ -114,8 +116,8 @@ async def signup(data:LoginData):
                 user = await conn.fetchrow(
                     "INSERT INTO users (email,password) VALUES ($1,$2) RETURNING *",email , hashed.decode("utf-8")
                 )   
-                redis_set("users", dict(user))
-                return {"signup":True}
+                cache_user(email, serialize_record(dict(user)))
+                return {"signup": True}
     except Exception as e:
         print(f"SIGNUP ERROR: {type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -129,11 +131,11 @@ async def login(data:LoginData):
         email = data.email
         password = data.password
         
-        results = redis_where("users","email",email)
-        if not results:
+        user = get_cached_user(email)
+        if not user:
             #DB FALLBACK COMING SOON
            pass
-        user = results[0]
+        
         if not user or not bcrypt.checkpw(
             password.encode(),user["password"].encode()
             ):
@@ -159,8 +161,32 @@ async def create_account(data:Accounts ,user_id:str = Depends(get_current_user) 
             account = await conn.fetchrow(
                 "INSERT INTO accounts (user_id,name,type) VALUES ($1,$2,$3) RETURNING *", user_id,name,account_type
             )
-            redis_set("accounts",dict(account))
+            cache_account(str(user_id), serialize_record(dict(account)))
 
         return {"sucess":True}
     except Exception as e:
         raise HTTPException(status_code=401, detail=str(e))
+
+#__________________________________________
+#GET ACCOUNT
+#__________________________________________
+@app.get("/account")
+async def get_account(user_id:str = Depends(get_current_user)):
+    try:
+        data = r.get(f"user_accounts:{user_id}")
+        if  data:
+            return json.loads(data)
+
+        async with pool.acquire() as conn:
+            accounts = await conn.fetch(
+                "SELECT * FROM accounts WHERE user_id=$1",user_id 
+            )
+            result = []
+            for account in accounts:
+                d = serialize_record(dict(account))
+                cache_account(user_id, d)
+                result.append(d)
+            return result    
+    except Exception as e:
+        raise HTTPException(status_code=500,detail=str(e))
+
