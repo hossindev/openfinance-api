@@ -21,11 +21,32 @@ SECRET_KEY=os.getenv("SECRET_KEY")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 60
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global pool
-    pool = await asyncpg.create_pool(DATABASE_URL)
+
+    retries = 5
+
+    for attempt in range(retries):
+        try:
+            pool = await asyncpg.create_pool(
+                DATABASE_URL,
+                timeout=30
+            )
+            print("Database connected")
+            break
+
+        except Exception as e:
+            print(f"DB connection failed: {e}")
+
+            if attempt == retries - 1:
+                raise e
+
+            await asyncio.sleep(5)
+
     yield
+
     await pool.close()
 app = FastAPI(lifespan=lifespan)
 security = HTTPBearer()
@@ -116,6 +137,9 @@ class TransactionData(BaseModel):
     description: str
 
 
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
 
 #__________________________________________
 #SIGNUP
