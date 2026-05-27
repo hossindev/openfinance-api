@@ -31,7 +31,7 @@ app = FastAPI(lifespan=lifespan)
 security = HTTPBearer()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # later the real url only
+    allow_origins=["https://finance.ryzzlab.xyz"],  # later the real url only
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -77,6 +77,22 @@ def serialize_record(record: dict) -> dict:
         for k, v in record.items()
     }
 
+def get_account(user_id: str, account_id: str):
+    key = f"user_accounts:{user_id}"
+
+    existing = r.get(key)
+
+    if not existing:
+        return None
+
+    accounts = json.loads(existing)
+
+    for account in accounts:
+        if account.get("account_id") == account_id:
+            return account
+
+    return None
+
 #__________________________________________
 #CLASSES
 #__________________________________________
@@ -91,6 +107,14 @@ class LoginData(BaseModel):
 class Accounts(BaseModel):
     name:str
     account_type:str
+
+class TransactionData(BaseModel):
+    account_id: int
+    amount: int
+    category_id:int
+    type: str
+    description: str
+
 
 
 #__________________________________________
@@ -163,7 +187,7 @@ async def create_account(data:Accounts ,user_id:str = Depends(get_current_user) 
             )
             cache_account(str(user_id), serialize_record(dict(account)))
 
-        return {"sucess":True}
+        return {"sucess":True,"account_id":account["id"]}
     except Exception as e:
         raise HTTPException(status_code=401, detail=str(e))
 
@@ -189,4 +213,81 @@ async def get_account(user_id:str = Depends(get_current_user)):
             return result    
     except Exception as e:
         raise HTTPException(status_code=500,detail=str(e))
+    
+#__________________________________________
+# TRANSACTIONS
+#__________________________________________
+@app.post("/create-transaction")
+async def create_transaction(
+    data: TransactionData,
+    user_id: str = Depends(get_current_user)
+):
+    try:
+        account_id = data.account_id
+        amount = data.amount
+        category_id = data.category_id
+        description = data.description
+        transaction_type = data.type
+
+        async with pool.acquire() as conn:
+
+            async with conn.transaction():
+
+                # income adds money, expense removes money
+                operator = "+" if transaction_type == "income" else "-"
+
+                update_balance = await conn.fetchrow(
+                    f"""
+                    UPDATE accounts
+                    SET balance = balance {operator} $1
+                    WHERE id = $2
+                    RETURNING *
+                    """,
+                    amount,
+                    account_id
+                )
+
+                if not update_balance:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Account not found"
+                    )
+
+                new_transaction = await conn.fetchrow(
+                    """
+                    INSERT INTO transactions
+                    (ammount, account_id, category_id, description, type)
+                    VALUES ($1, $2, $3, $4, $5)
+                    RETURNING *
+                    """,
+                    amount,
+                    account_id,
+                    category_id,
+                    description,
+                    transaction_type
+                )
+
+            r.delete(f"user_accounts:{user_id}")
+            cache_account(
+                user_id=user_id,
+                account_data=serialize_record(dict(update_balance))
+            )
+
+            return {
+                "success": True,
+                "account": serialize_record(dict(update_balance)),
+                "transaction": serialize_record(dict(new_transaction))
+            }
+
+    except HTTPException:
+        raise
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+    
+
+
 
