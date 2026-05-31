@@ -112,7 +112,7 @@ class Accounts(BaseModel):
     account_type:str
 
 class TransactionData(BaseModel):
-    account_id: int
+    account_id: str
     amount: int
     category_id:int
     type: str
