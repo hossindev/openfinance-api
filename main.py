@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import bcrypt
+import asyncio 
 import os
 import redis
 import asyncpg
@@ -85,12 +86,7 @@ def get_cached_user(email: str):
     data = r.get(f"user:{email}")
     return json.loads(data) if data else None
 
-def cache_account(user_id: str, account_data: dict):
-    key = f"user_accounts:{user_id}"
-    existing = r.get(key)
-    accounts = json.loads(existing) if existing else []
-    accounts.append(account_data)
-    r.set(key, json.dumps(accounts))
+
 
 def serialize_record(record: dict) -> dict:
     return {
@@ -98,21 +94,6 @@ def serialize_record(record: dict) -> dict:
         for k, v in record.items()
     }
 
-def get_account(user_id: str, account_id: str):
-    key = f"user_accounts:{user_id}"
-
-    existing = r.get(key)
-
-    if not existing:
-        return None
-
-    accounts = json.loads(existing)
-
-    for account in accounts:
-        if account.get("account_id") == account_id:
-            return account
-
-    return None
 
 #__________________________________________
 #CLASSES 
@@ -174,27 +155,34 @@ async def signup(data:LoginData):
 #LOGIN WITH JWT
 #__________________________________________
 @app.post("/login")
-async def login(data:LoginData):
+async def login(data: LoginData):
     try:
         email = data.email
         password = data.password
-        
+
         user = get_cached_user(email)
+
         if not user:
-            #DB FALLBACK COMING SOON
-           pass
-        
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT * FROM users WHERE email = $1", email
+                )
+                if row:
+                    user = serialize_record(dict(row))
+                    cache_user(email, user)
+
         if not user or not bcrypt.checkpw(
-            password.encode(),user["password"].encode()
-            ):
-                raise HTTPException(status_code=401, detail="Invalid credentials")
-        
-        
+            password.encode(), user["password"].encode()
+        ):
+            raise HTTPException(status_code=401, detail="Invalid credentials")
+
         access_token = create_access_token(data={"sub": str(user["user_id"])})
-        return{"login":True,"access_token":access_token, "token_type": "bearer"}
-        
+        return {"login": True, "access_token": access_token, "token_type": "bearer"}
+
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=401, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 #__________________________________________
@@ -209,7 +197,7 @@ async def create_account(data:Accounts ,user_id:str = Depends(get_current_user) 
             account = await conn.fetchrow(
                 "INSERT INTO accounts (user_id,name,type) VALUES ($1,$2,$3) RETURNING *", user_id,name,account_type
             )
-            cache_account(str(user_id), serialize_record(dict(account)))
+            r.delete(f"user_dashboard:{user_id}")
 
         return {"sucess":True,"account_id":account["id"]}
     except Exception as e:
@@ -218,22 +206,21 @@ async def create_account(data:Accounts ,user_id:str = Depends(get_current_user) 
 #__________________________________________
 #GET ACCOUNT
 #__________________________________________
-@app.get("/account")
-async def get_account(user_id:str = Depends(get_current_user)):
+@app.get("/me")
+async def get_me(user_id:str = Depends(get_current_user)):
     try:
-        data = r.get(f"user_accounts:{user_id}")
-        if  data:
-            return json.loads(data)
+        cached = r.get(f"user_dashboard:{user_id}")
+        if cached:
+            return json.loads(cached)
 
+        
         async with pool.acquire() as conn:
             accounts = await conn.fetch(
-                "SELECT * FROM accounts WHERE user_id=$1",user_id 
+                "SELECT * FROM accounts WHERE user_id=$1",
+                user_id
             )
-            result = []
-            for account in accounts:
-                d = serialize_record(dict(account))
-                cache_account(user_id, d)
-                result.append(d)
+            result = [serialize_record(dict(acc)) for acc in accounts]
+            r.set(f"user_dashboard:{user_id}", json.dumps(result))
             return result    
     except Exception as e:
         raise HTTPException(status_code=500,detail=str(e))
@@ -265,10 +252,12 @@ async def create_transaction(
                     UPDATE accounts
                     SET balance = balance {operator} $1
                     WHERE id = $2
+                    AND user_id=$3
                     RETURNING *
                     """,
                     amount,
-                    account_id
+                    account_id,
+                    user_id
                 )
 
                 if not update_balance:
@@ -291,11 +280,8 @@ async def create_transaction(
                     transaction_type
                 )
 
-            r.delete(f"user_accounts:{user_id}")
-            cache_account(
-                user_id=user_id,
-                account_data=serialize_record(dict(update_balance))
-            )
+            r.delete(f"user_dashboard:{user_id}")
+            
 
             return {
                 "success": True,
