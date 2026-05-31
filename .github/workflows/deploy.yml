@@ -28,8 +28,9 @@ jobs:
 
       - name: Health check
         run: |
+          sleep 15
           timeout 60 bash -c '
           until curl -f http://localhost:8000/health; do
-          echo "API not ready yet..."
-          sleep 2
+            echo "API not ready yet..."
+            sleep 2
           done'

@@ -32,9 +32,10 @@ async def lifespan(app: FastAPI):
     for attempt in range(retries):
         try:
             pool = await asyncpg.create_pool(
-                DATABASE_URL,
-                timeout=30
-            )
+    DATABASE_URL,
+    timeout=10,       # War 30
+    command_timeout=10
+)
             print("Database connected")
             break
 
