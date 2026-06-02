@@ -17,15 +17,14 @@ jobs:
         run: |
           test -d .venv || python3 -m venv .venv
           .venv/bin/pip install --upgrade pip
-          .venv/bin/pip install -r requirements.txt
+          .venv/bin/pip install --upgrade-strategy only-if-needed -r requirements.txt
 
       - name: Run database migrations
         run: |
           source .env
           psql "postgresql://openfinance:${password}@localhost/openfinance_db" \
-            -f ./database/init.sql \
-            --on-error-stop
-        continue-on-error: false
+            -v ON_ERROR_STOP=1 \
+            -f ./database/init.sql
 
       - name: Restart OpenFinance API
         run: |
