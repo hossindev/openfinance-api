@@ -15,9 +15,19 @@ jobs:
 
       - name: Set up venv and install requirements
         run: |
-          test -d .venv || python3 -m venv .venv
-          .venv/bin/pip install --upgrade pip
-          .venv/bin/pip install --upgrade-strategy only-if-needed -r requirements.txt
+          test -d /home/ryzzlab/openfinance/venv || python3 -m venv /home/ryzzlab/openfinance/venv
+
+          HASH_FILE="/home/ryzzlab/openfinance/.requirements_hash"
+          CURRENT_HASH=$(md5sum requirements.txt | awk '{print $1}')
+
+          if [ ! -f "$HASH_FILE" ] || [ "$(cat $HASH_FILE)" != "$CURRENT_HASH" ]; then
+            echo "requirements.txt changed, installing..."
+            /home/ryzzlab/openfinance/venv/bin/pip install --upgrade pip --quiet
+            /home/ryzzlab/openfinance/venv/bin/pip install -r requirements.txt --quiet
+            echo "$CURRENT_HASH" > "$HASH_FILE"
+          else
+            echo "requirements.txt unchanged, skipping install."
+          fi
 
       - name: Run database migrations
         run: |
