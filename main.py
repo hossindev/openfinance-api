@@ -3,7 +3,8 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt
 from datetime import datetime, timedelta
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
+from typing import Literal
 import bcrypt
 import asyncio 
 import os
@@ -80,12 +81,7 @@ async def get_current_user(credentials:HTTPAuthorizationCredentials = Depends(se
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Invalid or expired token or {str(e)}")
     
-def cache_user(email: str, user_data: dict):
-    r.set(f"user:{email}", json.dumps(user_data))
 
-def get_cached_user(email: str):
-    data = r.get(f"user:{email}")
-    return json.loads(data) if data else None
 
 
 
@@ -115,8 +111,19 @@ class TransactionData(BaseModel):
     account_id: str
     amount: int
     category_id:int
-    type: str
+    type: Literal["income", "expense"]
     description: str
+    @field_validator("amount")
+    @classmethod
+    def amount_must_be_positive(cls,v):
+        if v <=0:
+            raise ValueError("Amount must be greater than 0")
+        return v
+
+class Budget(BaseModel):
+    limit_amount:int
+    id:str
+
 
 
 @app.get("/health")
@@ -133,11 +140,9 @@ async def signup(data:LoginData):
         password = data.password
         hashed = bcrypt.hashpw(password.encode("utf-8"),bcrypt.gensalt())
         
-        existing = get_cached_user(email)
-        if existing:
-            return{"error":"user already exists"}
-        else:
-            async with pool.acquire() as conn:
+        
+        
+        async with pool.acquire() as conn:
                 existing = await conn.fetchrow(
                     "SELECT * FROM users WHERE email = $1",email
                 )
@@ -146,7 +151,7 @@ async def signup(data:LoginData):
                 user = await conn.fetchrow(
                     "INSERT INTO users (email,password) VALUES ($1,$2) RETURNING *",email , hashed.decode("utf-8")
                 )   
-                cache_user(email, serialize_record(dict(user)))
+                
                 return {"signup": True}
     except Exception as e:
         print(f"SIGNUP ERROR: {type(e).__name__}: {e}")
@@ -161,16 +166,17 @@ async def login(data: LoginData):
         email = data.email
         password = data.password
 
-        user = get_cached_user(email)
+        
 
-        if not user:
-            async with pool.acquire() as conn:
+        
+        async with pool.acquire() as conn:
                 row = await conn.fetchrow(
                     "SELECT * FROM users WHERE email = $1", email
                 )
+                user = None
                 if row:
                     user = serialize_record(dict(row))
-                    cache_user(email, user)
+                    
 
         if not user or not bcrypt.checkpw(
             password.encode(), user["password"].encode()
@@ -202,29 +208,62 @@ async def create_account(data:Accounts ,user_id:str = Depends(get_current_user) 
 
         return {"sucess":True,"account_id":account["id"]}
     except Exception as e:
-        raise HTTPException(status_code=401, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 #__________________________________________
 #GET ACCOUNT
 #__________________________________________
 @app.get("/me")
-async def get_me(user_id:str = Depends(get_current_user)):
+async def get_me(user_id: str = Depends(get_current_user)):
     try:
         cached = r.get(f"user_dashboard:{user_id}")
         if cached:
             return json.loads(cached)
 
-        
         async with pool.acquire() as conn:
             accounts = await conn.fetch(
-                "SELECT * FROM accounts WHERE user_id=$1",
-                user_id
+                "SELECT * FROM accounts WHERE user_id = $1", user_id
             )
-            result = [serialize_record(dict(acc)) for acc in accounts]
-            r.set(f"user_dashboard:{user_id}", json.dumps(result))
-            return result    
+
+            if not accounts:
+                return []
+
+            account_ids = [acc["id"] for acc in accounts]
+
+            transactions = await conn.fetch(
+                "SELECT * FROM transactions WHERE account_id = ANY($1)",
+                account_ids
+            )
+
+            budgets = await conn.fetch(
+                "SELECT * FROM budgets WHERE account_id = ANY($1)",
+                account_ids
+            )
+
+        # Group transactions and budgets by account_id for fast lookup
+        tx_by_account: dict[str, list] = {}
+        for tx in transactions:
+            tx = serialize_record(dict(tx))
+            tx_by_account.setdefault(tx["account_id"], []).append(tx)
+
+        budget_by_account: dict[str, dict] = {}
+        for b in budgets:
+            b = serialize_record(dict(b))
+            budget_by_account[b["account_id"]] = b
+
+        result = []
+        for acc in accounts:
+            acc = serialize_record(dict(acc))
+            acc_id = acc["id"]
+            acc["transactions"] = tx_by_account.get(acc_id, [])
+            acc["budget"] = budget_by_account.get(acc_id, None)
+            result.append(acc)
+
+        r.set(f"user_dashboard:{user_id}", json.dumps(result), ex=300)
+        return result
+
     except Exception as e:
-        raise HTTPException(status_code=500,detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
     
 #__________________________________________
 # TRANSACTIONS
@@ -246,6 +285,16 @@ async def create_transaction(
             async with conn.transaction():
 
                 # income adds money, expense removes money
+                if transaction_type == "expense":
+                    row = await conn.fetchrow(
+            "SELECT balance FROM accounts WHERE id = $1 AND user_id = $2",
+            account_id, user_id
+        )
+                    if not row:
+                        raise HTTPException(status_code=404, detail="Account not found")
+                    if row["balance"] < amount:
+                        raise HTTPException(status_code=400, detail="Insufficient funds")
+
                 operator = "+" if transaction_type == "income" else "-"
 
                 update_balance = await conn.fetchrow(
@@ -260,6 +309,12 @@ async def create_transaction(
                     account_id,
                     user_id
                 )
+                if operator == "-":
+                    update_budget = await conn.execute("""
+    UPDATE budgets
+    SET spent_ammount = spent_ammount + $1
+    WHERE account_id = $2
+""", amount, account_id)
 
                 if not update_balance:
                     raise HTTPException(
@@ -298,7 +353,37 @@ async def create_transaction(
             status_code=500,
             detail=str(e)
         )
+
+@app.get("/transactions")
+async def get_transactions(user_id: str = Depends(get_current_user)):
+    try:
+        async with pool.acquire() as conn:
+            accounts_data = await conn.fetch(
+                "SELECT id FROM accounts WHERE user_id=$1", user_id
+            )
+            account_ids = [row["id"] for row in accounts_data]
+
+            if not account_ids:
+                return []
+
+            transactions = await conn.fetch(
+                "SELECT * FROM transactions WHERE account_id = ANY($1)",
+                account_ids
+            )
+            return [serialize_record(dict(tx)) for tx in transactions]
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
     
-
-
-
+@app.post("/budget")
+async def create_budget(data:Budget,user_id: str = Depends(get_current_user)):
+    try:
+        async with pool.acquire() as conn:
+            budget_insert = await conn.fetch("INSERT INTO budgets (account_id,limit_amount) VALUES($1,$2) RETURNING *",data.id,data.limit_amount)
+        return True
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

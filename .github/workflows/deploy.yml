@@ -1,13 +1,10 @@
 name: Deploy OpenFinance API
-
 on:
   push:
     branches: [main]
-
 jobs:
   deploy:
     runs-on: self-hosted
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -21,6 +18,14 @@ jobs:
           test -d .venv || python3 -m venv .venv
           .venv/bin/pip install --upgrade pip
           .venv/bin/pip install -r requirements.txt
+
+      - name: Run database migrations
+        run: |
+          source .env
+          psql "postgresql://openfinance:${password}@localhost/openfinance_db" \
+            -f ./database/init.sql \
+            --on-error-stop
+        continue-on-error: false
 
       - name: Restart OpenFinance API
         run: |
